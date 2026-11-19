@@ -685,7 +685,7 @@ function renderTable(){
     return '<tr class="'+(isFav?"fav":"")+(isNew?" isnew":"")+'">'+
     '<td class="cck"><input type="checkbox" data-act="select" data-pid="'+p.pid+'"'+(ck?" checked":"")+'></td>'+
     '<td class="cfv'+(isFav?" on":"")+'" data-act="fav" data-port="'+p.port+'" title="收藏置顶">'+(isFav?"★":"☆")+'</td>'+
-    '<td class="cport"><span class="pr">TCP</span><span class="colorDot" data-color-port="'+p.port+'" title="点击切换颜色标记" style="background:var(--faint)"></span>'+p.port+(isNew?'<span class="bnew">NEW</span>':"")+'</td>'+
+    '<td class="cport"><span class="pr">'+(p.protocol||"tcp").toUpperCase()+'</span><span class="colorDot" data-color-port="'+p.port+'" title="点击切换颜色标记" style="background:var(--faint)"></span>'+p.port+(isNew?'<span class="bnew">NEW</span>':"")+'</td>'+
     '<td><span class="cat '+p.category+'">'+catName(p.category)+'</span><span class="clab">'+esc(p.label)+'</span>'+(notes[p.port]?'<span class="cnote" title="备注（双击行编辑）">📝 '+esc(notes[p.port])+'</span>':'')+'</td>'+
     '<td class="cproc" data-act="detail" data-pid="'+p.pid+'" title="查看进程详情">'+esc(p.process)+'</td>'+
     '<td class="cpid">'+p.pid+'</td>'+

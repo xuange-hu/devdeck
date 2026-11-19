@@ -10,8 +10,10 @@ export interface PortEntry {
   port: number;
   pid: number;
   process: string;
+  protocol: "tcp" | "udp";
   mem?: number;
   cpuSec?: number;
+  path?: string;
   category: PortCategory;
   label: string;
 }
@@ -126,34 +128,44 @@ async function getProcMap(): Promise<Map<number, ProcInfo>> {
 }
 
 async function parseWindows(): Promise<PortEntry[]> {
-  const [netstat, procs] = await Promise.all([
+  const [tcp, udp, procs] = await Promise.all([
     execTimeout("netstat", ["-ano", "-p", "tcp"]),
+    execTimeout("netstat", ["-ano", "-p", "udp"]).catch(() => ({ stdout: "" })),
     getProcMap(),
   ]);
-  const portToPid = new Map<number, number>();
-  for (const line of netstat.stdout.split("\n")) {
+  const results = new Map<string, PortEntry>();
+  const add = (port: number, pid: number, protocol: "tcp" | "udp") => {
+    const key = protocol + ":" + port;
+    if (results.has(key)) return;
+    const info = procs.get(pid);
+    results.set(key, {
+      port,
+      pid,
+      protocol,
+      process: info?.name ?? "unknown",
+      mem: info?.memKb,
+      cpuSec: info?.cpuSec,
+      path: info?.path,
+      ...metaFor(port),
+    });
+  };
+  for (const line of tcp.stdout.split("\n")) {
     const cols = line.trim().split(/\s+/);
     if (cols.length < 5 || cols[3] !== "LISTENING") continue;
-    const local = cols[1];
-    const port = Number(local?.split(":").pop());
+    const port = Number(cols[1]?.split(":").pop());
     const pid = Number(cols[4]);
-    if (!port || Number.isNaN(pid) || pid === 0) continue;
-    if (!portToPid.has(port)) portToPid.set(port, pid);
+    if (!port || !pid) continue;
+    add(port, pid, "tcp");
   }
-  return [...portToPid]
-    .map(([port, pid]) => {
-      const info = procs.get(pid);
-      return {
-        port,
-        pid,
-        process: info?.name ?? "unknown",
-        mem: info?.memKb,
-        cpuSec: info?.cpuSec,
-        path: info?.path,
-        ...metaFor(port),
-      };
-    })
-    .sort((a, b) => a.port - b.port);
+  for (const line of udp.stdout.split("\n")) {
+    const cols = line.trim().split(/\s+/);
+    if (cols.length < 4 || cols[0] !== "UDP") continue;
+    const port = Number(cols[1]?.split(":").pop());
+    const pid = Number(cols[cols.length - 1]);
+    if (!port || !pid) continue;
+    add(port, pid, "udp");
+  }
+  return [...results.values()].sort((a, b) => a.port - b.port || a.protocol.localeCompare(b.protocol));
 }
 
 async function parseUnix(): Promise<PortEntry[]> {
@@ -184,7 +196,7 @@ async function parseUnix(): Promise<PortEntry[]> {
     }
     if (!port || Number.isNaN(pid) || pid === 0) continue;
     if (!entries.has(port))
-      entries.set(port, { port, pid, process: name, ...metaFor(port) });
+      entries.set(port, { port, pid, protocol: "tcp", process: name, ...metaFor(port) });
   }
   return [...entries.values()].sort((a, b) => a.port - b.port);
 }
@@ -203,14 +215,20 @@ export async function listAllListening(): Promise<PortEntry[]> {
   return scan();
 }
 
-export async function killPort(pid: number): Promise<void> {
+export async function killPort(pid: number, tree = false): Promise<void> {
   if (!Number.isInteger(pid) || pid <= 0) {
     throw new Error(`无效的 PID: ${pid}`);
   }
   try {
     if (process.platform === "win32") {
-      await execTimeout("taskkill", ["/PID", String(pid), "/F"]);
+      const args = tree
+        ? ["/PID", String(pid), "/T", "/F"]
+        : ["/PID", String(pid), "/F"];
+      await execTimeout("taskkill", args);
     } else {
+      if (tree) {
+        await execTimeout("pkill", ["-9", "-P", String(pid)]).catch(() => ({}));
+      }
       await execTimeout("kill", ["-9", String(pid)]);
     }
   } catch (err) {

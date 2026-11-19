@@ -372,6 +372,19 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
     }
 
     if (req.method === "GET" && path === "/api/suggest-port") {
+      const start = Number(url.searchParams.get("start"));
+      const end = Number(url.searchParams.get("end"));
+      const count = Math.max(1, Math.min(50, Number(url.searchParams.get("count") || 1)));
+      if (Number.isInteger(start) && Number.isInteger(end) && end > start) {
+        const scan = await getScan();
+        const used = new Set(scan.all.map((e) => e.port));
+        const free: number[] = [];
+        for (let p = Math.max(1, start); p <= Math.min(65535, end) && free.length < count; p++) {
+          if (!used.has(p)) free.push(p);
+        }
+        json(res, 200, { start, end, free });
+        return;
+      }
       const port = Number(url.searchParams.get("port"));
       if (!Number.isInteger(port) || port <= 0 || port > 65535) {
         json(res, 400, { ok: false, message: "端口无效" });
@@ -457,7 +470,7 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
 
     if (req.method === "POST" && path === "/api/kill") {
       try {
-        const body = JSON.parse(await readBody(req)) as { pid?: unknown; pids?: unknown; port?: unknown };
+        const body = JSON.parse(await readBody(req)) as { pid?: unknown; pids?: unknown; port?: unknown; tree?: unknown };
         let pids: number[];
         if (body.port) {
           const target = Number(body.port);
@@ -479,7 +492,7 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
         const results: { pid: number; ok: boolean; message?: string }[] = [];
         for (const pid of valid) {
           try {
-            await killPort(pid);
+            await killPort(pid, body.tree === true);
             results.push({ pid, ok: true });
             audit("kill", `PID ${pid}`);
           } catch (err) {

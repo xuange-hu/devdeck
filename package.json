@@ -1,6 +1,6 @@
 {
   "name": "devdeck-cli",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "开发端口监管控制台：实时监控、一键释放被占用端口（CLI + Web UI）",
   "type": "module",
   "bin": {

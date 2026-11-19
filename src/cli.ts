@@ -25,6 +25,7 @@ interface Flags {
   noOpen: boolean;
   all: boolean;
   json: boolean;
+  tree: boolean;
 }
 
 const ANSI = {
@@ -67,7 +68,7 @@ function getVersion(): string {
 }
 
 function parseFlags(args: string[]): Flags {
-  const flags: Flags = { noOpen: false, all: false, json: false };
+  const flags: Flags = { noOpen: false, all: false, json: false, tree: false };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--port" || arg === "-p") {
@@ -90,6 +91,8 @@ function parseFlags(args: string[]): Flags {
       flags.all = true;
     } else if (arg === "--json") {
       flags.json = true;
+    } else if (arg === "--tree") {
+      flags.tree = true;
     } else if (arg === "--no-color") {
       USE_COLOR = false;
     }
@@ -117,6 +120,7 @@ const HELP = `DevDeck v${getVersion()} — 开发端口监管控制台
                          --out, -o <路径>         输出文件（默认 devdeck-ports-<时间>.<格式>）
                          --all, -a                导出全部端口
   devdeck kill <pid>...  终止指定进程（可一次多个）
+  --tree  终止进程树
   devdeck kill-port <端口>...  按端口终止占用进程
   devdeck help           显示本帮助
   devdeck version        显示版本号
@@ -263,6 +267,26 @@ async function cmdExport(flags: Flags): Promise<void> {
   console.log(color("✓", "green") + ` 已导出 ${entries.length} 条端口记录 → ${out}`);
 }
 
+async function cmdFree(start: number, end: number): Promise<void> {
+  if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start || start < 1 || end > 65535) {
+    console.error("用法: devdeck free <起> <止>   （示例: devdeck free 8000 8100）");
+    process.exitCode = 2;
+    return;
+  }
+  const entries = await listAllListening();
+  const used = new Set(entries.map((e) => e.port));
+  const free: number[] = [];
+  for (let p = start; p <= end && free.length < 20; p++) {
+    if (!used.has(p)) free.push(p);
+  }
+  if (free.length === 0) {
+    console.log(color(`范围 ${start}-${end} 内无空闲端口`, "yellow"));
+  } else {
+    console.log(color(`范围 ${start}-${end} 内空闲端口（前 ${free.length} 个）：`, "green"));
+    console.log(free.join(", "));
+  }
+}
+
 async function cmdCheck(query: string): Promise<void> {
   const port = Number(query);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -304,7 +328,7 @@ async function cmdKillByPort(ports: string[]): Promise<void> {
   }
 }
 
-async function cmdKill(pids: string[]): Promise<void> {
+async function cmdKill(pids: string[], tree = false): Promise<void> {
   if (pids.length === 0) {
     console.error("用法: devdeck kill <pid> [pid...]");
     process.exitCode = 1;
@@ -314,7 +338,7 @@ async function cmdKill(pids: string[]): Promise<void> {
   for (const raw of pids) {
     const pid = Number(raw);
     try {
-      await killPort(pid);
+      await killPort(pid, tree);
       console.log(color("✓", "green") + ` 已终止进程 ${pid}`);
     } catch (err) {
       failed++;
@@ -400,6 +424,12 @@ async function main(): Promise<void> {
     case "export":
       await cmdExport(flags);
       break;
+    case "free": {
+      const a = Number(rest.find((x) => !x.startsWith("-")) ?? 0);
+      const b = Number(rest.filter((x) => !x.startsWith("-"))[1] ?? 0);
+      await cmdFree(a, b);
+      break;
+    }
     case "check": {
       const q = rest.find((a) => !a.startsWith("-")) ?? "";
       await cmdCheck(q);
@@ -410,7 +440,7 @@ async function main(): Promise<void> {
       break;
     case "kill": {
       const pids = rest.filter((a) => !a.startsWith("-"));
-      await cmdKill(pids);
+      await cmdKill(pids, flags.tree);
       break;
     }
     case "help":

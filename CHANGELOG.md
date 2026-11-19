@@ -2,6 +2,21 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0] - 2026-11-18
+
+融合竞品优点。
+
+### 新增
+
+- **UDP 端口扫描**：TCP + UDP 双协议（借鉴 lsoff / somo / TCPView）
+- **协议标识**：界面显示每个端口是 TCP 还是 UDP
+- **进程树终止**：`devdeck kill <pid> --tree`（借鉴 fkill tree kill），Windows 用 `taskkill /T`
+- **范围查找可用端口**：`devdeck free <起> <止>`（借鉴 get-port / portfinder），API `/api/suggest-port?start=&end=`
+
+### 测试
+
+- 测试扩至 **37 项**（7 单元 + 30 端到端），全部通过
+
 ## [0.6.0] - 2026-11-16
 
 第五批十项功能。

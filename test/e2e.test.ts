@@ -317,3 +317,16 @@ test("E2E: /api/export 支持 Excel XML", async () => {
   assert.ok(t.includes("Workbook"));
   assert.ok(t.includes("ss:Type"));
 });
+
+test("E2E: /api/suggest-port 范围查找", async () => {
+  const r = await fetch(`${BASE}/api/suggest-port?start=59000&end=59010`);
+  const d = (await r.json()) as { free: number[] };
+  assert.ok(Array.isArray(d.free));
+  assert.ok(d.free.length > 0);
+});
+
+test("E2E: CLI free 范围查找", () => {
+  const r = spawnSync(process.execPath, [CLI, "free", "59000", "59010"], { encoding: "utf-8", timeout: 30000 });
+  assert.equal(r.status, 0);
+  assert.ok((r.stdout || "").includes("空闲"));
+});

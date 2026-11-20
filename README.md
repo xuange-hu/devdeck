@@ -147,8 +147,8 @@ npm run build:exe
 生成 `dist/devdeck.exe`（约 90MB，内置 Node 运行时与 Web UI，无需安装 Node 即可运行）。
 
 ```bash
-distdevdeck.exe             # 启动 Web 控制台
-distdevdeck.exe scan --all  # 命令行
+dist/devdeck.exe             # 启动 Web 控制台
+dist/devdeck.exe scan --all  # 命令行
 ```
 
 原理：esbuild 打包 CJS → Node SEA 生成 blob → postject 注入 Node 运行时（`scripts/build-exe.js` 自动化）。

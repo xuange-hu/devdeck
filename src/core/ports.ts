@@ -168,37 +168,78 @@ async function parseWindows(): Promise<PortEntry[]> {
   return [...results.values()].sort((a, b) => a.port - b.port || a.protocol.localeCompare(b.protocol));
 }
 
-async function parseUnix(): Promise<PortEntry[]> {
-  let stdout = "";
-  try {
-    ({ stdout } = await execTimeout("lsof", ["-iTCP", "-sTCP:LISTEN", "-n", "-P"]));
-  } catch {
-    try {
-      ({ stdout } = await execTimeout("ss", ["-tlnp"]));
-    } catch {
-      return [];
-    }
-  }
+/**
+ * Parse `lsof -iTCP -sTCP:LISTEN -n -P` output into listening sockets.
+ * Exported for unit tests so the Linux path can be verified on any platform
+ * without invoking lsof (the CI regression was a wrong column index here).
+ *
+ *   COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+ *   node    412 runner 21u IPv4 12345 0t0 TCP 127.0.0.1:18770 (LISTEN)
+ */
+export function parseLsofOutput(stdout: string): PortEntry[] {
   const entries = new Map<number, PortEntry>();
   for (const line of stdout.split("\n")) {
-    let port = NaN;
-    let pid = NaN;
-    let name = "unknown";
-    if (line.includes("LISTEN") && line.includes("->") === false) {
-      const cols = line.trim().split(/\s+/);
-      const local = cols[8] ?? cols[4] ?? "";
-      port = Number(local.split(":").pop());
-      const m = line.match(/pid=(\d+)/) ?? line.match(/\b(\d+)\/(\w[\w.-]*)/);
-      if (m) {
-        pid = Number(m[1]);
-        name = m[2] ?? name;
-      }
-    }
-    if (!port || Number.isNaN(pid) || pid === 0) continue;
+    if (!line.includes("LISTEN")) continue;
+    const cols = line.trim().split(/\s+/);
+    // "TCP <local_addr> (LISTEN)": local addr is the token right before (LISTEN)
+    const li = cols.findIndex((c) => c === "TCP" || c === "TCP6");
+    const local = li >= 0 ? cols[li + 1] : "";
+    const port = Number((local ?? "").split(":").pop());
+    const pid = Number(cols[1]);           // lsof pid is always column 2
+    const name = cols[0] || "unknown";     // command is column 1
+    if (!port || !Number.isInteger(pid) || pid === 0) continue;
     if (!entries.has(port))
       entries.set(port, { port, pid, protocol: "tcp", process: name, ...metaFor(port) });
   }
   return [...entries.values()].sort((a, b) => a.port - b.port);
+}
+
+/**
+ * Parse `ss -tlnp` output into listening sockets.
+ *
+ *   State  Recv-Q Send-Q Local Address:Port  Peer Address:Port  Process
+ *   LISTEN 0      4096   0.0.0.0:8080       0.0.0.0:*           users:(("node",pid=412,fd=21))
+ *   LISTEN 0      128    [::]:443           [::]:*              users:(("nginx",pid=7,fd=6))
+ */
+export function parseSsOutput(stdout: string): PortEntry[] {
+  const entries = new Map<number, PortEntry>();
+  for (const line of stdout.split("\n")) {
+    if (!line.trim().startsWith("LISTEN")) continue;
+    const cols = line.trim().split(/\s+/);
+    // column 4 is the LOCAL address:port (column 5 is the peer). bracketed
+    // IPv6 like [::]:443 still yields "443" from the trailing split.
+    const local = cols[3] ?? "";
+    const port = Number(local.split(":").pop());
+    const pm = line.match(/pid=(\d+)/);
+    const nm = line.match(/users:\(\("([^"]+)"/);
+    const pid = pm ? Number(pm[1]) : NaN;
+    const name = nm?.[1] ?? "unknown";
+    if (!port || !Number.isInteger(pid) || pid === 0) continue;
+    if (!entries.has(port))
+      entries.set(port, { port, pid, protocol: "tcp", process: name, ...metaFor(port) });
+  }
+  return [...entries.values()].sort((a, b) => a.port - b.port);
+}
+
+function mergeUnixEntries(groups: PortEntry[][]): PortEntry[] {
+  const entries = new Map<number, PortEntry>();
+  for (const group of groups)
+    for (const e of group) if (!entries.has(e.port)) entries.set(e.port, e);
+  return [...entries.values()].sort((a, b) => a.port - b.port);
+}
+
+async function parseUnix(): Promise<PortEntry[]> {
+  // Try BOTH lsof and ss: either may be missing on a minimal runner, and a
+  // tool can exist but lack permission to see another process's pid. Merging
+  // the two views recovers sockets that one alone would silently drop.
+  const [lsof, ss] = await Promise.allSettled([
+    execTimeout("lsof", ["-iTCP", "-sTCP:LISTEN", "-n", "-P"]).then((r) => parseLsofOutput(r.stdout)),
+    execTimeout("ss", ["-tlnp"]).then((r) => parseSsOutput(r.stdout)),
+  ]);
+  const groups: PortEntry[][] = [];
+  if (lsof.status === "fulfilled") groups.push(lsof.value);
+  if (ss.status === "fulfilled") groups.push(ss.value);
+  return mergeUnixEntries(groups);
 }
 
 async function scan(): Promise<PortEntry[]> {

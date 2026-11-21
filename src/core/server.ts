@@ -128,6 +128,77 @@ async function readBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
+const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+/**
+ * 写接口守卫：挡掉"浏览器跨站简单请求"这一类 CSRF。
+ *
+ * 三条独立闸门，任意一条不满足即拒绝：
+ *  1. Content-Type 必须是 application/json —— 跨站 <form>、text/plain 的
+ *     fetch 无法在不触发 CORS 预检的前提下设置该类型，于是"钓鱼页盲打
+ *     127.0.0.1 管理接口"这条路被物理掐断；
+ *  2. Origin（浏览器一定会带）必须与 Host 同源；
+ *  3. Sec-Fetch-Site（现代浏览器）只能是 same-origin / none。
+ *
+ * 早期版本只有一个"前端二次确认"，而前端弹窗对 CSRF 没有任何约束力。
+ */
+function guardWrite(req: IncomingMessage, res: ServerResponse): boolean {
+  const ctype = String(req.headers["content-type"] ?? "").toLowerCase();
+  if (!ctype.startsWith("application/json")) {
+    json(res, 415, {
+      ok: false,
+      message: "写接口只接受 application/json（跨站简单请求一律拒绝）",
+    });
+    return false;
+  }
+
+  const origin = req.headers.origin;
+  if (typeof origin === "string") {
+    const host = String(req.headers.host ?? "");
+    if (origin === "null" || origin !== `http://${host}`) {
+      json(res, 403, { ok: false, message: "跨站写请求已被拒绝（Origin 校验失败）" });
+      return false;
+    }
+  }
+
+  const site = req.headers["sec-fetch-site"];
+  if (typeof site === "string" && site !== "same-origin" && site !== "none") {
+    json(res, 403, { ok: false, message: "跨站写请求已被拒绝（Sec-Fetch-Site 校验失败）" });
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * 系统关键进程黑名单：即使某进程正在监听端口，也不允许"一键释放"。
+ * pid <= 4 覆盖 Windows 的 Idle(0)/System(4) 与 POSIX 的 init(1)/kthreadd(2)；
+ * process.pid 是 devdeck 自己 —— 自我了断只会让排查更困难。
+ */
+const PROTECTED_PROCESS_NAMES = new Set([
+  "system",
+  "idle",
+  "smss.exe",
+  "csrss.exe",
+  "wininit.exe",
+  "winlogon.exe",
+  "services.exe",
+  "lsass.exe",
+  "svchost.exe",
+  "fontdrvhost.exe",
+  "dwm.exe",
+  "init",
+  "kthreadd",
+  "systemd",
+  "launchd",
+  "kernel_task",
+]);
+
+function isProtectedPid(pid: number, name: string): boolean {
+  if (pid <= 4 || pid === process.pid) return true;
+  return PROTECTED_PROCESS_NAMES.has(name.trim().toLowerCase());
+}
+
 async function sendWebhook(url: string, event: PortEvent): Promise<void> {
   if (!url) return;
   try {
@@ -198,6 +269,9 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const path = url.pathname;
+
+    // 所有写方法先过 CSRF 守卫，再做业务解析：解析器不该为陌生网页服务。
+    if (UNSAFE_METHODS.has(req.method ?? "") && !guardWrite(req, res)) return;
 
     if (req.method === "GET" && path === "/api/ports") {
       const scope = url.searchParams.get("scope") === "all" ? "all" : "dev";
@@ -490,7 +564,24 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
           return;
         }
         const results: { pid: number; ok: boolean; message?: string }[] = [];
+        // PID 白名单：只允许终止"当前扫描中确实在监听端口、且不是系统关键进程"
+        // 的 PID。即使前两道闸门被绕过，也无法盲杀任意进程；同时天然免疫
+        // "扫描与 kill 之间 PID 被系统复用"的竞态。
+        const scanForKill = await getScan();
+        const listening = new Map(scanForKill.all.map((e) => [e.pid, e.process]));
         for (const pid of valid) {
+          if (isProtectedPid(pid, listening.get(pid) ?? "")) {
+            results.push({ pid, ok: false, message: "系统关键进程，拒绝终止" });
+            continue;
+          }
+          if (!listening.has(pid)) {
+            results.push({
+              pid,
+              ok: false,
+              message: "该 PID 不在当前端口扫描结果中（已退出或并非监听进程），已拒绝",
+            });
+            continue;
+          }
           try {
             await killPort(pid, body.tree === true);
             results.push({ pid, ok: true });

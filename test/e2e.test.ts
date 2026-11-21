@@ -147,6 +147,53 @@ test("E2E: 未知 API 返回 404", async () => {
   assert.equal(r.status, 404);
 });
 
+// —— CSRF 守卫回归：这三条对应审计报告里"钓鱼网页盲杀本机进程"的利用链 ——
+test("SEC: 跨站简单请求（text/plain）写接口被拒 415", async () => {
+  const r = await retryFetch(`${BASE}/api/kill`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain" },
+    body: JSON.stringify({ pids: [1] }),
+  });
+  assert.equal(r.status, 415);
+});
+
+test("SEC: 跨源 Origin 的写请求被拒 403", async () => {
+  const r = await retryFetch(`${BASE}/api/kill`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Origin: "https://evil.example",
+    },
+    body: JSON.stringify({ pids: [1] }),
+  });
+  assert.equal(r.status, 403);
+});
+
+test("SEC: Sec-Fetch-Site: cross-site 的写请求被拒 403", async () => {
+  const r = await retryFetch(`${BASE}/api/config`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "Sec-Fetch-Site": "cross-site",
+    },
+    body: JSON.stringify({ interval: 5 }),
+  });
+  assert.equal(r.status, 403);
+});
+
+test("SEC: 系统关键 PID 与扫描外的 PID 一律拒绝终止", async () => {
+  const r = await retryFetch(`${BASE}/api/kill`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pids: [4, 424242] }),
+  });
+  assert.equal(r.status, 207);
+  const d = (await r.json()) as { results: { pid: number; ok: boolean; message?: string }[] };
+  for (const item of d.results) assert.equal(item.ok, false);
+  assert.ok(d.results.some((x) => (x.message ?? "").includes("系统关键进程")));
+  assert.ok(d.results.some((x) => (x.message ?? "").includes("不在当前端口扫描结果")));
+});
+
 test("E2E: CLI scan 退出码 0 且输出表头", () => {
   const r = spawnSync(process.execPath, [CLI, "scan", "--all", "--no-color"], {
     encoding: "utf-8",

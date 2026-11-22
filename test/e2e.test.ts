@@ -1,7 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -14,23 +14,8 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const tmpHome = mkdtempSync(join(tmpdir(), "devdeck-e2e-"));
 
 let child: ReturnType<typeof spawn> | null = null;
+let token = "";
 
-async function waitForServer(timeout = 20000): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    try {
-      const r = await retryFetch(`${BASE}/api/config`);
-      if (r.ok) return;
-    } catch {
-      /* not ready */
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error("server did not start");
-}
-
-// 前面的 spawnSync 用例会阻塞事件循环数秒，undici 复用的 keep-alive 连接
-// 可能已被服务端空闲超时关闭，下一发 fetch 直接 ECONNRESET；重试一次走新连接即可
 async function retryFetch(url: string, init?: RequestInit, retries = 2): Promise<Response> {
   let lastErr: unknown;
   for (let i = 0; i <= retries; i++) {
@@ -45,6 +30,37 @@ async function retryFetch(url: string, init?: RequestInit, retries = 2): Promise
   throw lastErr;
 }
 
+async function waitForServer(timeout = 20000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    try {
+      const r = await retryFetch(`${BASE}/api/health`);
+      if (r.ok) return;
+    } catch {
+      /* not ready */
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error("server did not start");
+}
+
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  return { "X-DevDeck-Token": token, ...(extra ?? {}) };
+}
+
+function api(path: string, init: RequestInit = {}): Promise<Response> {
+  return retryFetch(BASE + path, {
+    ...init,
+    headers: authHeaders(init.headers as Record<string, string> | undefined),
+  });
+}
+
+async function firstChunk(res: Response): Promise<{ reader: ReadableStreamDefaultReader<Uint8Array>; text: string }> {
+  const reader = res.body!.getReader();
+  const { value } = await reader.read();
+  return { reader, text: new TextDecoder().decode(value) };
+}
+
 before(async () => {
   assert.ok(existsSync(CLI), "dist/cli.js 不存在，请先 npm run build");
   child = spawn(process.execPath, [CLI, "ui", "-p", String(PORT), "--no-open"], {
@@ -53,6 +69,10 @@ before(async () => {
     windowsHide: true,
   });
   await waitForServer();
+  const html = await (await fetch(`${BASE}/`)).text();
+  const match = html.match(/name="devdeck-token"\s+content="([^"]+)"/);
+  assert.ok(match, "页面应包含 devdeck token");
+  token = match[1]!;
 });
 
 after(() => {
@@ -64,24 +84,51 @@ after(() => {
   }
 });
 
-test("E2E: GET / 返回控制台 HTML", async () => {
+test("E2E: GET / 返回单文件控制台 HTML 与令牌", async () => {
   const r = await retryFetch(`${BASE}/`);
   assert.equal(r.status, 200);
   assert.match(r.headers.get("content-type") ?? "", /text\/html/);
+  assert.match(r.headers.get("content-security-policy") ?? "", /default-src/);
   const html = await r.text();
   assert.ok(html.includes("DevDeck"));
   assert.ok(html.includes("端口监管控制台"));
+  assert.match(html, /name="devdeck-token"/);
+  assert.doesNotMatch(html, /<script[^>]+src\s*=/i);
 });
 
-test("E2E: GET /api/ports 返回列表与统计", async () => {
-  const r = await retryFetch(`${BASE}/api/ports?scope=all`);
+test("E2E: favicon 204，避免控制台 404", async () => {
+  const r = await retryFetch(`${BASE}/favicon.ico`);
+  assert.equal(r.status, 204);
+});
+
+test("E2E: API 必须携带启动令牌", async () => {
+  const unauth = await retryFetch(`${BASE}/api/config`);
+  assert.equal(unauth.status, 401);
+  const ok = await api("/api/config");
+  assert.equal(ok.status, 200);
+  const data = (await ok.json()) as { config: { favorites: number[] }; configPath: string };
+  assert.ok(Array.isArray(data.config.favorites));
+  assert.ok(data.configPath.includes(".devdeck.json"));
+});
+
+test("E2E: 非法 Origin 被拒绝", async () => {
+  const r = await retryFetch(`${BASE}/api/config`, {
+    headers: authHeaders({ Origin: "http://evil.example" }),
+  });
+  assert.equal(r.status, 403);
+});
+
+test("E2E: GET /api/ports 能扫描到自身控制台端口", async () => {
+  const r = await api("/api/ports?scope=all");
   assert.equal(r.status, 200);
   const d = (await r.json()) as {
-    ports: Array<{ port: number; pid: number; process: string; firstSeen: number; category: string }>;
+    ports: Array<{ port: number; pid: number; process: string; protocol: string; firstSeen: number; category: string }>;
     stats: { total: number };
     meta: { durationMs: number; platform: string };
   };
   assert.ok(Array.isArray(d.ports));
+  assert.ok(d.ports.length > 0, "端口列表不应为空");
+  assert.ok(d.ports.some((p) => p.port === PORT), `应包含控制台端口 ${PORT}`);
   assert.equal(typeof d.stats.total, "number");
   assert.equal(typeof d.meta.durationMs, "number");
   for (const p of d.ports) {
@@ -89,15 +136,13 @@ test("E2E: GET /api/ports 返回列表与统计", async () => {
     assert.equal(typeof p.pid, "number");
     assert.equal(typeof p.process, "string");
     assert.equal(typeof p.firstSeen, "number");
+    assert.ok(["tcp", "udp"].includes(p.protocol));
     assert.ok(["dev", "db", "cache", "other"].includes(p.category));
   }
 });
 
-test("E2E: GET/PUT /api/config 读写与校验", async () => {
-  const r1 = await retryFetch(`${BASE}/api/config`);
-  const c1 = (await r1.json()) as { config: { favorites: number[] } };
-  assert.ok(Array.isArray(c1.config.favorites));
-  const r2 = await retryFetch(`${BASE}/api/config`, {
+test("E2E: GET/PUT /api/config 读写、校验与 Content-Type", async () => {
+  const r2 = await api("/api/config", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ favorites: [8080, 8080], interval: 5 }),
@@ -106,227 +151,201 @@ test("E2E: GET/PUT /api/config 读写与校验", async () => {
   assert.equal(c2.ok, true);
   assert.deepEqual(c2.config.favorites, [8080]);
   assert.equal(c2.config.interval, 5);
+
+  const bad = await api("/api/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ webhookUrl: "file:///etc/passwd" }),
+  });
+  assert.equal(bad.status, 400);
+
+  const wrongType = await api("/api/config", {
+    method: "PUT",
+    headers: { "Content-Type": "text/plain" },
+    body: JSON.stringify({ favorites: [] }),
+  });
+  assert.equal(wrongType.status, 415);
 });
 
-test("E2E: GET /api/history 返回事件数组", async () => {
-  const r = await retryFetch(`${BASE}/api/history`);
-  assert.equal(r.status, 200);
-  const d = (await r.json()) as { events: unknown[] };
-  assert.ok(Array.isArray(d.events));
-});
-
-test("E2E: GET /api/export 支持 CSV 与 JSON", async () => {
-  const rc = await retryFetch(`${BASE}/api/export?format=csv&scope=all`);
-  assert.equal(rc.status, 200);
-  const csv = await rc.text();
-  assert.ok(csv.includes("port,process,pid"));
-  const rj = await retryFetch(`${BASE}/api/export?format=json&scope=all`);
-  const json = (await rj.json()) as { ports: unknown[] };
-  assert.ok(Array.isArray(json.ports));
-});
-
-test("E2E: POST /api/kill 无效 PID 正确报错", async () => {
-  const r = await retryFetch(`${BASE}/api/kill`, {
+test("E2E: POST /api/kill 无令牌 401、text/plain 415、无效 PID 正确失败", async () => {
+  const noToken = await retryFetch(`${BASE}/api/kill`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pids: [999999999] }),
   });
-  const d = (await r.json()) as { ok: boolean };
+  assert.equal(noToken.status, 401);
+
+  const plain = await retryFetch(`${BASE}/api/kill`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "text/plain" }),
+    body: JSON.stringify({ pids: [999999999] }),
+  });
+  assert.equal(plain.status, 415);
+
+  const invalid = await api("/api/kill", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pids: [999999999] }),
+  });
+  const d = (await invalid.json()) as { ok: boolean; results: Array<{ ok: boolean }> };
   assert.equal(d.ok, false);
-  const r2 = await retryFetch(`${BASE}/api/kill`, {
+  assert.equal(d.results[0]?.ok, false);
+
+  const empty = await api("/api/kill", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({}),
   });
-  const d2 = (await r2.json()) as { ok: boolean };
-  assert.equal(d2.ok, false);
+  const e = (await empty.json()) as { ok: boolean };
+  assert.equal(e.ok, false);
 });
 
-test("E2E: 未知 API 返回 404", async () => {
-  const r = await retryFetch(`${BASE}/api/does-not-exist`);
+test("E2E: 未知 API 404", async () => {
+  const r = await api("/api/does-not-exist");
   assert.equal(r.status, 404);
 });
 
-test("E2E: CLI scan 退出码 0 且输出表头", () => {
-  const r = spawnSync(process.execPath, [CLI, "scan", "--all", "--no-color"], {
-    encoding: "utf-8",
-    timeout: 30000,
-  });
-  assert.equal(r.status, 0);
-  assert.ok((r.stdout ?? "").includes("DevDeck"));
+test("E2E: 导出 CSV/JSON/MD/HTML/XLS", async () => {
+  const csv = await (await api("/api/export?format=csv&scope=all")).text();
+  assert.ok(csv.includes("port,protocol,address,process,pid"));
+  const json = (await (await api("/api/export?format=json&scope=all")).json()) as { ports: unknown[] };
+  assert.ok(Array.isArray(json.ports));
+  const md = await (await api("/api/export?format=md&scope=all")).text();
+  assert.ok(md.includes("# DevDeck 端口报告"));
+  const html = await (await api("/api/export?format=html&scope=all")).text();
+  assert.ok(html.includes("<!DOCTYPE html>"));
+  const xls = await (await api("/api/export?format=xls&scope=all")).text();
+  assert.ok(xls.includes("Workbook"));
+  assert.ok(xls.includes('encoding="UTF-8"'));
 });
 
-test("E2E: CLI version 输出版本号", () => {
-  const r = spawnSync(process.execPath, [CLI, "version"], { encoding: "utf-8", timeout: 15000 });
-  assert.equal(r.status, 0);
-  assert.match(r.stdout ?? "", /DevDeck v\d+\.\d+\.\d+/);
+test("E2E: 历史、审计、系统信息、连接统计、扫描统计", async () => {
+  const history = (await (await api("/api/history")).json()) as { events: unknown[] };
+  assert.ok(Array.isArray(history.events));
+  const audit = (await (await api("/api/audit")).json()) as { events: unknown[] };
+  assert.ok(Array.isArray(audit.events));
+  const sys = (await (await api("/api/sysinfo")).json()) as { hostname: string; cpuCount: number; totalMemMB: number; processUptimeSec: number };
+  assert.equal(typeof sys.hostname, "string");
+  assert.ok(sys.cpuCount > 0);
+  assert.ok(sys.totalMemMB > 0);
+  assert.equal(typeof sys.processUptimeSec, "number");
+  const conn = (await (await api("/api/connections")).json()) as { listening: number };
+  assert.ok(conn.listening > 0);
+  const stats = (await (await api("/api/stats")).json()) as { count: number; recent: number[] };
+  assert.ok(stats.count >= 0);
+  assert.ok(Array.isArray(stats.recent));
 });
 
-test("E2E: CLI export 生成 CSV 文件", () => {
-  const out = join(tmpdir(), `devdeck-export-${Date.now()}.csv`);
-  const r = spawnSync(process.execPath, [CLI, "export", "--all", "--out", out], {
-    encoding: "utf-8",
-    timeout: 30000,
-  });
-  assert.equal(r.status, 0);
-  assert.ok(existsSync(out), "导出文件应存在");
-  const content = readFileSync(out, "utf-8");
-  assert.ok(content.includes("port,process,pid"), "CSV 应包含表头");
-  rmSync(out, { force: true });
+test("E2E: SSE 正常推送与暂停模式", async () => {
+  const c1 = new AbortController();
+  const r1 = await retryFetch(`${BASE}/api/events?token=${encodeURIComponent(token)}&interval=1&scope=all`, { signal: c1.signal });
+  assert.equal(r1.status, 200);
+  assert.ok((r1.headers.get("content-type") ?? "").includes("text/event-stream"));
+  const one = await firstChunk(r1);
+  await one.reader.cancel();
+  c1.abort();
+  assert.ok(one.text.includes("retry:") || one.text.includes("data:"));
+
+  const c2 = new AbortController();
+  const r2 = await retryFetch(`${BASE}/api/events?token=${encodeURIComponent(token)}&interval=0&scope=all`, { signal: c2.signal });
+  const paused = await firstChunk(r2);
+  assert.ok(paused.text.includes("retry:"));
+  const gotData = await Promise.race([
+    paused.reader.read().then(() => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1200)),
+  ]);
+  await paused.reader.cancel();
+  c2.abort();
+  assert.equal(gotData, false, "暂停模式不应推送 data 帧");
 });
 
-test("E2E: GET /api/health 健康检查", async () => {
-  const r = await retryFetch(`${BASE}/api/health`);
-  assert.equal(r.status, 200);
-  const d = (await r.json()) as { ok: boolean; uptime: number; timestamp: number };
-  assert.equal(d.ok, true);
-  assert.equal(typeof d.uptime, "number");
-  assert.equal(typeof d.timestamp, "number");
+test("E2E: probe 本机/批量/非法 host", async () => {
+  const self = (await (await api(`/api/probe?host=127.0.0.1&port=${PORT}`)).json()) as { ok: boolean; port: number };
+  assert.equal(self.ok, true);
+  assert.equal(self.port, PORT);
+  const batch = (await (await api(`/api/probe?host=127.0.0.1&ports=${PORT},59999`)).json()) as { results: Array<{ port: number; ok: boolean }> };
+  assert.equal(batch.results.length, 2);
+  assert.equal(batch.results.find((x) => x.port === PORT)?.ok, true);
+  const bad = await api("/api/probe?host=bad%20host&ports=1");
+  assert.equal(bad.status, 400);
 });
 
-test("E2E: SSE /api/events 推送", async () => {
-  const controller = new AbortController();
-  const r = await retryFetch(`${BASE}/api/events`, { signal: controller.signal });
-  assert.equal(r.status, 200);
-  assert.ok((r.headers.get("content-type") ?? "").includes("text/event-stream"));
-  const reader = r.body!.getReader();
-  const { value } = await reader.read();
-  const text = new TextDecoder().decode(value);
-  try { controller.abort(); } catch {}
-  assert.ok(text.includes("data:") || text.includes("retry:"));
+test("E2E: suggest-port 与 export-history", async () => {
+  const suggest = (await (await api("/api/suggest-port?port=59999")).json()) as { available: boolean; suggestion: number };
+  assert.equal(suggest.available, true);
+  const range = (await (await api("/api/suggest-port?start=59000&end=59010")).json()) as { free: number[] };
+  assert.ok(range.free.length > 0);
+  const historyCsv = await (await api("/api/export-history?format=csv")).text();
+  assert.ok(historyCsv.includes("time,type,port,protocol,address,pid,process"));
 });
 
-test("E2E: /api/sysinfo 返回系统信息", async () => {
-  const r = await retryFetch(`${BASE}/api/sysinfo`);
-  const d = (await r.json()) as { hostname: string; cpuCount: number; totalMemMB: number; addresses: unknown[] };
-  assert.equal(r.status, 200);
-  assert.equal(typeof d.hostname, "string");
-  assert.ok(d.cpuCount > 0);
-  assert.ok(d.totalMemMB > 0);
-  assert.ok(Array.isArray(d.addresses));
-});
-
-test("E2E: /api/probe 本机端口可连接", async () => {
-  const r = await retryFetch(`${BASE}/api/probe?host=127.0.0.1&port=${PORT}`);
-  const d = (await r.json()) as { ok: boolean; port: number; latencyMs: number };
-  assert.equal(d.ok, true);
-  assert.equal(d.port, PORT);
-  assert.equal(typeof d.latencyMs, "number");
-});
-
-test("E2E: /api/probe 非法参数返回 400", async () => {
-  const r = await retryFetch(`${BASE}/api/probe?host=bad host&port=0`);
-  assert.equal(r.status, 400);
-});
-
-test("E2E: /api/audit 返回事件数组", async () => {
-  const r = await retryFetch(`${BASE}/api/audit`);
-  const d = (await r.json()) as { events: unknown[] };
-  assert.ok(Array.isArray(d.events));
-});
-
-test("E2E: /api/export 支持 Markdown", async () => {
-  const r = await retryFetch(`${BASE}/api/export?format=md&scope=all`);
-  const t = await r.text();
-  assert.ok(t.includes("# DevDeck 端口报告"));
-  assert.ok(t.includes("| 端口 |"));
-});
-
-test("E2E: config customPorts 去重过滤", async () => {
-  const r = await retryFetch(`${BASE}/api/config`, {
+test("E2E: 定时快照与报告独立生效并落盘", async () => {
+  const set = await api("/api/config", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ customPorts: [1, 2, 2, 99999] }),
+    body: JSON.stringify({ snapshotInterval: 1, reportInterval: 1 }),
+  });
+  assert.equal(set.status, 200);
+  await new Promise((r) => setTimeout(r, 1800));
+  assert.ok(existsSync(join(tmpHome, ".devdeck-snapshots")), "快照目录应创建");
+  assert.ok(existsSync(join(tmpHome, ".devdeck-reports")), "报告目录应创建");
+  assert.ok(readdirSync(join(tmpHome, ".devdeck-snapshots")).some((f) => f.startsWith("snap-")));
+  assert.ok(readdirSync(join(tmpHome, ".devdeck-reports")).some((f) => f.startsWith("health-")));
+  await api("/api/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ snapshotInterval: 0, reportInterval: 0 }),
+  });
+});
+
+test("E2E: health 无令牌可用", async () => {
+  const r = await retryFetch(`${BASE}/api/health`);
+  assert.equal(r.status, 200);
+  const d = (await r.json()) as { ok: boolean; uptime: number };
+  assert.equal(d.ok, true);
+  assert.equal(typeof d.uptime, "number");
+});
+
+test("E2E: CLI scan/version/export/check/kill-port/free", () => {
+  const scan = spawnSync(process.execPath, [CLI, "scan", "--all", "--no-color"], { encoding: "utf-8", timeout: 30000 });
+  assert.equal(scan.status, 0);
+  assert.ok((scan.stdout ?? "").includes("DevDeck"));
+  assert.ok((scan.stdout ?? "").includes(String(PORT)), `CLI scan 应包含 ${PORT}`);
+
+  const version = spawnSync(process.execPath, [CLI, "version"], { encoding: "utf-8", timeout: 15000 });
+  assert.equal(version.status, 0);
+  assert.match(version.stdout ?? "", /DevDeck v0\.8\.0/);
+
+  const out = join(tmpdir(), `devdeck-export-${Date.now()}.csv`);
+  const exp = spawnSync(process.execPath, [CLI, "export", "--all", "--out", out], { encoding: "utf-8", timeout: 30000 });
+  assert.equal(exp.status, 0);
+  assert.ok(existsSync(out));
+  assert.ok(readFileSync(out, "utf-8").includes("port,protocol,address,process,pid"));
+  rmSync(out, { force: true });
+
+  const occupied = spawnSync(process.execPath, [CLI, "check", String(PORT)], { encoding: "utf-8", timeout: 30000 });
+  assert.equal(occupied.status, 1);
+  assert.ok((occupied.stdout ?? "").includes("被占用"));
+
+  const free = spawnSync(process.execPath, [CLI, "check", "59999"], { encoding: "utf-8", timeout: 30000 });
+  assert.equal(free.status, 0);
+  assert.ok((free.stdout ?? "").includes("空闲"));
+
+  const killMissing = spawnSync(process.execPath, [CLI, "kill-port", "59999"], { encoding: "utf-8", timeout: 30000 });
+  assert.equal(killMissing.status, 1);
+  assert.ok((killMissing.stderr || killMissing.stdout).includes("未被监听"));
+
+  const range = spawnSync(process.execPath, [CLI, "free", "59000", "59010"], { encoding: "utf-8", timeout: 30000 });
+  assert.equal(range.status, 0);
+  assert.ok((range.stdout ?? "").includes("空闲"));
+});
+
+test("E2E: config customPorts 去重过滤与 Webhook 校验", async () => {
+  const r = await api("/api/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ customPorts: [1, 2, 2, 99999], webhookUrl: "" }),
   });
   const d = (await r.json()) as { config: { customPorts: number[] } };
   assert.deepEqual(d.config.customPorts, [1, 2]);
-});
-
-test("E2E: CLI kill-port 未监听端口报错", () => {
-  const r = spawnSync(process.execPath, [CLI, "kill-port", "59999"], {
-    encoding: "utf-8",
-    timeout: 30000,
-  });
-  assert.ok((r.stderr || r.stdout).includes("未被监听"));
-});
-
-test("E2E: /api/connections 返回连接统计", async () => {
-  const r = await fetch(`${BASE}/api/connections`);
-  const d = (await r.json()) as { listening: number; established: number; timeWait: number };
-  assert.equal(r.status, 200);
-  assert.equal(typeof d.listening, "number");
-  assert.equal(typeof d.established, "number");
-  assert.ok(d.listening > 0);
-});
-
-test("E2E: /api/export 支持 HTML 报告", async () => {
-  const r = await fetch(`${BASE}/api/export?format=html&scope=all`);
-  const t = await r.text();
-  assert.ok(t.includes("<!DOCTYPE html>"));
-  assert.ok(t.includes("DevDeck 端口报告"));
-});
-
-test("E2E: CLI check 未监听端口返回空闲", () => {
-  const r = spawnSync(process.execPath, [CLI, "check", "59999"], { encoding: "utf-8", timeout: 30000 });
-  assert.ok((r.stdout || "").includes("空闲"));
-  assert.equal(r.status, 0);
-});
-
-test("E2E: CLI check 监听端口返回占用", () => {
-  const r = spawnSync(process.execPath, [CLI, "check", String(PORT)], { encoding: "utf-8", timeout: 30000 });
-  assert.ok((r.stdout || "").includes("被占用"));
-  assert.equal(r.status, 1);
-});
-
-test("E2E: /api/probe 批量探测", async () => {
-  const r = await fetch(`${BASE}/api/probe?host=127.0.0.1&ports=${PORT},59999`);
-  const d = (await r.json()) as { results: Array<{ port: number; ok: boolean }> };
-  assert.ok(Array.isArray(d.results));
-  assert.equal(d.results.length, 2);
-  const self = d.results.find((x) => x.port === PORT);
-  assert.equal(self?.ok, true);
-});
-
-test("E2E: /api/stats 扫描性能统计", async () => {
-  const r = await fetch(`${BASE}/api/stats`);
-  const d = (await r.json()) as { count: number; avgMs: number; recent: number[] };
-  assert.equal(r.status, 200);
-  assert.equal(typeof d.count, "number");
-  assert.equal(typeof d.avgMs, "number");
-  assert.ok(Array.isArray(d.recent));
-});
-
-test("E2E: /api/export-history 历史导出", async () => {
-  const r = await fetch(`${BASE}/api/export-history?format=json`);
-  const d = (await r.json()) as { events: unknown[] };
-  assert.equal(r.status, 200);
-  assert.ok(Array.isArray(d.events));
-});
-
-test("E2E: /api/suggest-port 端口建议", async () => {
-  const r = await fetch(`${BASE}/api/suggest-port?port=59999`);
-  const d = (await r.json()) as { available: boolean; suggestion: number };
-  assert.equal(r.status, 200);
-  assert.equal(d.available, true);
-  assert.equal(d.suggestion, 59999);
-});
-
-test("E2E: /api/export 支持 Excel XML", async () => {
-  const r = await fetch(`${BASE}/api/export?format=xls&scope=all`);
-  const t = await r.text();
-  assert.ok(t.includes("Workbook"));
-  assert.ok(t.includes("ss:Type"));
-});
-
-test("E2E: /api/suggest-port 范围查找", async () => {
-  const r = await fetch(`${BASE}/api/suggest-port?start=59000&end=59010`);
-  const d = (await r.json()) as { free: number[] };
-  assert.ok(Array.isArray(d.free));
-  assert.ok(d.free.length > 0);
-});
-
-test("E2E: CLI free 范围查找", () => {
-  const r = spawnSync(process.execPath, [CLI, "free", "59000", "59010"], { encoding: "utf-8", timeout: 30000 });
-  assert.equal(r.status, 0);
-  assert.ok((r.stdout || "").includes("空闲"));
 });

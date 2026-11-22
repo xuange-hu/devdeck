@@ -1,11 +1,11 @@
 ﻿import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { startServer } from "./core/server.js";
 import { killPort, listAllListening, listDevPorts, type PortEntry } from "./core/ports.js";
-import { toMarkdown, toHtml, toExcelXml } from "./core/serialize.js";
+import { toCsv, toMarkdown, toHtml, toExcelXml } from "./core/serialize.js";
 import { dispWidth, pad } from "./core/text.js";
 
 const exec = promisify(execFile);
@@ -26,6 +26,7 @@ interface Flags {
   all: boolean;
   json: boolean;
   tree: boolean;
+  unknown: string[];
 }
 
 const ANSI = {
@@ -68,7 +69,7 @@ function getVersion(): string {
 }
 
 function parseFlags(args: string[]): Flags {
-  const flags: Flags = { noOpen: false, all: false, json: false, tree: false };
+  const flags: Flags = { noOpen: false, all: false, json: false, tree: false, unknown: [] };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--port" || arg === "-p") {
@@ -95,6 +96,8 @@ function parseFlags(args: string[]): Flags {
       flags.tree = true;
     } else if (arg === "--no-color") {
       USE_COLOR = false;
+    } else if (arg && arg.startsWith("-")) {
+      flags.unknown.push(arg);
     }
   }
   return flags;
@@ -116,9 +119,11 @@ const HELP = `DevDeck v${getVersion()} — 开发端口监管控制台
   devdeck find <查询>     按端口/进程名/服务查找占用
                          --all, -a             在全部端口中查找
   devdeck export [选项]   导出端口列表到文件
-                         --format, -f <csv|json|md>  导出格式（默认 csv）
+                         --format, -f <csv|json|md|html|xls>  导出格式（默认 csv）
                          --out, -o <路径>         输出文件（默认 devdeck-ports-<时间>.<格式>）
                          --all, -a                导出全部端口
+  devdeck free <起> <止>  查找范围内可用端口
+  devdeck check <端口>    检查端口占用（退出码 0=空闲 / 1=占用）
   devdeck kill <pid>...  终止指定进程（可一次多个）
   --tree  终止进程树
   devdeck kill-port <端口>...  按端口终止占用进程
@@ -197,15 +202,25 @@ async function cmdScan(flags: Flags): Promise<void> {
 async function cmdWatch(flags: Flags): Promise<void> {
   const interval = flags.interval ?? 3;
   let prev: Set<number> | null = null;
+  let running = false;
   const tick = async () => {
-    const entries = flags.all ? await listAllListening() : await listDevPorts();
-    const current = new Set(entries.map((e) => e.port));
-    process.stdout.write("\x1b[2J\x1b[H");
-    const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-    renderTable(entries, `⬢ DevDeck 实时监控  ${now}  · 每 ${interval}s 刷新  · Ctrl+C 退出`, prev);
-    prev = current;
-    console.log("");
-    console.log(summarize(entries, flags.all));
+    if (running) return;
+    running = true;
+    try {
+      const entries = flags.all ? await listAllListening() : await listDevPorts();
+      const current = new Set(entries.map((e) => e.port));
+      if (process.stdout.isTTY) process.stdout.write("\x1b[2J\x1b[H");
+      const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      renderTable(entries, `⬢ DevDeck 实时监控  ${now}  · 每 ${interval}s 刷新  · Ctrl+C 退出`, prev);
+      prev = current;
+      console.log("");
+      console.log(summarize(entries, flags.all));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(color("✗", "red") + " 扫描失败：" + message);
+    } finally {
+      running = false;
+    }
   };
   await tick();
   const timer = setInterval(() => {
@@ -254,15 +269,11 @@ async function cmdExport(flags: Flags): Promise<void> {
   } else if (format === "xls") {
     content = toExcelXml(entries);
   } else {
-    const header = "port,process,pid,memory_kb,category,label";
-    const rows = entries.map(
-      (e) =>
-        `${e.port},"${e.process.replace(/"/g, '""')}",${e.pid},${e.mem ?? ""},${e.category},"${e.label}"`,
-    );
-    content = "\uFEFF" + [header, ...rows].join("\r\n");
+    content = toCsv(entries);
   }
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
   const out = flags.out ?? `devdeck-ports-${stamp}.${format}`;
+  mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, content, "utf-8");
   console.log(color("✓", "green") + ` 已导出 ${entries.length} 条端口记录 → ${out}`);
 }
@@ -295,9 +306,14 @@ async function cmdCheck(query: string): Promise<void> {
     return;
   }
   const entries = await listAllListening();
-  const hit = entries.find((e) => e.port === port);
-  if (hit) {
-    console.log(color(`端口 ${port} 被占用`, "yellow") + `：${hit.process}（PID ${hit.pid}）`);
+  const hits = entries.filter((e) => e.port === port);
+  if (hits.length > 0) {
+    for (const hit of hits) {
+      console.log(
+        color(`端口 ${port} 被占用`, "yellow") +
+          `：${hit.process}（PID ${hit.pid}，${hit.protocol.toUpperCase()} ${hit.address ?? ""}）`,
+      );
+    }
     process.exitCode = 1;
   } else {
     console.log(color(`端口 ${port} 空闲`, "green"));
@@ -311,21 +327,34 @@ async function cmdKillByPort(ports: string[]): Promise<void> {
     return;
   }
   const entries = await listAllListening();
+  let failed = 0;
   for (const raw of ports) {
     const port = Number(raw);
-    const hit = entries.find((e) => e.port === port);
-    if (!hit) {
+    const hits = entries.filter((e) => e.port === port);
+    if (hits.length === 0) {
+      failed++;
       console.error(color("✗", "red") + ` 端口 ${port} 当前未被监听`);
       continue;
     }
-    try {
-      await killPort(hit.pid);
-      console.log(color("✓", "green") + ` 端口 ${port}（${hit.process}，PID ${hit.pid}）已终止`);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(color("✗", "red") + " " + message);
+    const pids = [...new Set(hits.map((e) => e.pid).filter((pid) => pid > 0))];
+    if (pids.length === 0) {
+      failed++;
+      console.error(color("✗", "red") + ` 端口 ${port} 没有可终止的进程信息`);
+      continue;
+    }
+    for (const pid of pids) {
+      const processName = hits.find((e) => e.pid === pid)?.process ?? "unknown";
+      try {
+        await killPort(pid);
+        console.log(color("✓", "green") + ` 端口 ${port}（${processName}，PID ${pid}）已终止`);
+      } catch (err) {
+        failed++;
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(color("✗", "red") + " " + message);
+      }
     }
   }
+  if (failed > 0) process.exitCode = 1;
 }
 
 async function cmdKill(pids: string[], tree = false): Promise<void> {
@@ -349,23 +378,6 @@ async function cmdKill(pids: string[], tree = false): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
-async function openAppWindow(url: string): Promise<void> {
-  if (process.platform === "win32") {
-    const candidates: [string, string][] = [
-      ["chrome", "--app=" + url],
-      ["msedge", "--app=" + url],
-    ];
-    for (const [cmd, arg] of candidates) {
-      try {
-        await exec("cmd", ["/c", "start", "", cmd, arg], { windowsHide: true });
-        return;
-      } catch {
-        /* 尝试下一个浏览器 */
-      }
-    }
-  }
-  await openAppWindow(url);
-}
 
 async function openBrowser(url: string): Promise<void> {
   try {
@@ -404,6 +416,9 @@ async function cmdUi(flags: Flags): Promise<void> {
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   const flags = parseFlags(rest);
+  if (flags.unknown.length > 0) {
+    console.error(`忽略未知选项: ${flags.unknown.join(" ")}`);
+  }
   switch (cmd ?? "ui") {
     case "ui":
     case "start":

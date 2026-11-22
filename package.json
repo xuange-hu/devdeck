@@ -1,8 +1,16 @@
 {
   "name": "devdeck-cli",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "开发端口监管控制台：实时监控、一键释放被占用端口（CLI + Web UI）",
   "type": "module",
+  "homepage": "https://github.com/xuange-hu/devdeck#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xuange-hu/devdeck.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xuange-hu/devdeck/issues"
+  },
   "bin": {
     "devdeck": "./dist/cli.js"
   },
@@ -18,7 +26,7 @@
     "start": "node dist/cli.js",
     "scan": "node dist/cli.js scan",
     "ui": "node dist/cli.js ui",
-    "test": "node --import tsx --test test/unit.test.ts test/e2e.test.ts",
+    "test": "node --import tsx --test test/unit.test.ts test/frontend.test.ts test/e2e.test.ts",
     "build:exe": "node scripts/build-exe.js"
   },
   "engines": {

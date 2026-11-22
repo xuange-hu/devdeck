@@ -1,0 +1,72 @@
+{
+  "name": "devdeck-vscode",
+  "displayName": "DevDeck 端口监管",
+  "description": "在 VS Code 内查看、打开与释放本地监听端口",
+  "version": "0.1.0",
+  "publisher": "xuange-hu",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "port",
+    "process",
+    "devtool",
+    "devdeck",
+    "network"
+  ],
+  "activationEvents": [
+    "onCommand:devdeck.openConsole",
+    "onCommand:devdeck.stopConsole",
+    "onCommand:devdeck.scanPorts",
+    "onCommand:devdeck.killPort"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "devdeck.openConsole",
+        "title": "DevDeck: 打开端口控制台",
+        "category": "DevDeck"
+      },
+      {
+        "command": "devdeck.scanPorts",
+        "title": "DevDeck: 查看监听端口",
+        "category": "DevDeck"
+      },
+      {
+        "command": "devdeck.killPort",
+        "title": "DevDeck: 按端口终止进程",
+        "category": "DevDeck"
+      },
+      {
+        "command": "devdeck.stopConsole",
+        "title": "DevDeck: 停止端口控制台",
+        "category": "DevDeck"
+      }
+    ],
+    "configuration": {
+      "title": "DevDeck",
+      "properties": {
+        "devdeck.executable": {
+          "type": "string",
+          "default": "devdeck",
+          "description": "devdeck 可执行文件路径；默认使用 PATH 中的 devdeck，若工作区存在 dist/cli.js 则自动回退到本地构建产物"
+        },
+        "devdeck.port": {
+          "type": "number",
+          "default": 7676,
+          "description": "Web 控制台端口"
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xuange-hu/devdeck.git",
+    "directory": "vscode"
+  },
+  "license": "MIT"
+}

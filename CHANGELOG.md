@@ -2,6 +2,27 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0] - 2026-11-20
+
+全面修复审查中发现的阻断与高危问题。
+
+### 修复
+
+- **Web 控制台改为单文件内联**：删除 9 个从未被加载的外部脚本，修复首屏 `renderGroupFilter is not defined`、数据加载 `checkMemThreshold/checkMemLeak` 崩溃、设置面板 `loadIntegrationInputs` 崩溃；所有按钮重新可达
+- **跨平台解析重写**：macOS/Linux 的 `lsof -F` 与 `ss -H` 正确读取 PID、进程名、本地地址；补充 Unix UDP；Windows 同端口多地址不再被错误去重
+- **安全加固**：启动令牌、Host/Origin/Sec-Fetch-Site 校验、写操作 `application/json` 校验；Webhook 协议校验；CSP/X-Frame-Options/nosniff/Referrer-Policy；修复 text/plain CSRF 与批量 probe 绕过
+- **SSE 与定时任务**：刷新间隔/暂停通过查询参数实时生效；定时器运行中可重建；`reportInterval` 不再依赖 `snapshotInterval`；快照/报告保留最近 200 个文件
+- **数据与状态**：首次占用时间与最后端口快照持久化，重启后历史与占用时长更准确；配置原子写入并保留 `.bak`；CSV/Excel/Markdown 转义与编码修复
+- **界面正确性**：修复表头/表体列错位、设置面板 DOM 嵌套、忽略端口无法恢复、导出当前列表不生效、复制终止命令硬编码 Windows
+- **主题/i18n/无障碍/响应式**：暗/亮/高对比三态、自定义主色、英文表头与动态文案、输入框内快捷键冲突、弹窗焦点与 aria、移动端列隐藏与工具栏滚动
+- **CLI**：`watch` 失败不再退出、扫描不重叠、`kill-port` 未监听返回非零、HELP 补齐 `free/check/html/xls`、未知选项提示
+- **第二轮打磨**：弹窗焦点陷阱、排序表头键盘操作、刷新时保留焦点与滚动位置、令牌失效自动刷新、SSE 连接上限、令牌时序安全比较；CLI `check/kill-port` 处理同端口多进程；CI 增加 Windows matrix；新增 SECURITY / CONTRIBUTING / Issue / PR 模板
+
+### 测试
+
+- 测试扩至 **38 项**（11 单元 + 10 前端完整性 + 17 端到端），全部通过
+- 新增 lsof/ss/Windows 解析 fixture、令牌/CSRF/Origin 负向用例、SSE 暂停、定时报告落盘、前端无外部脚本与关键函数完整性检查
+
 ## [0.7.0] - 2026-11-18
 
 融合竞品优点。

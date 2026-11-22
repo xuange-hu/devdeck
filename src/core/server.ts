@@ -1,9 +1,29 @@
 ﻿import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  readdirSync,
+  unlinkSync,
+} from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { homedir, hostname, platform, arch, release, cpus, totalmem, freemem, loadavg, uptime, networkInterfaces } from "node:os";
+import {
+  homedir,
+  hostname,
+  platform,
+  arch,
+  release,
+  cpus,
+  totalmem,
+  freemem,
+  loadavg,
+  uptime,
+  networkInterfaces,
+} from "node:os";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import embeddedHtml from "../web/index.html";
 import {
   COMMON_PORTS,
@@ -15,10 +35,19 @@ import {
   type PortEntry,
 } from "./ports.js";
 import { configPath, loadConfig, saveConfig, type DevDeckConfig } from "./config.js";
-import { normalizeConfig, toCsv, toMarkdown, toHtml, toExcelXml } from "./serialize.js";
+import {
+  normalizeConfig,
+  toCsv,
+  toMarkdown,
+  toHtml,
+  toExcelXml,
+  csvEscape,
+} from "./serialize.js";
 
 const SCAN_CACHE_TTL = 800;
 const MAX_EVENTS = 300;
+const MAX_ARTIFACTS = 200;
+const MAX_SSE_CLIENTS = 32;
 const HERE = (() => {
   try {
     return dirname(fileURLToPath(import.meta.url));
@@ -29,6 +58,10 @@ const HERE = (() => {
 
 const HISTORY_PATH = join(homedir(), ".devdeck-history.json");
 const AUDIT_PATH = join(homedir(), ".devdeck-audit.json");
+const FIRST_SEEN_PATH = join(homedir(), ".devdeck-first-seen.json");
+const LAST_PORTS_PATH = join(homedir(), ".devdeck-last-ports.json");
+const SNAPSHOT_DIR = join(homedir(), ".devdeck-snapshots");
+const REPORT_DIR = join(homedir(), ".devdeck-reports");
 
 interface AuditEntry {
   time: number;
@@ -36,55 +69,14 @@ interface AuditEntry {
   detail: string;
 }
 
-function audit(action: string, detail: string): void {
-  try {
-    let list: AuditEntry[] = [];
-    try {
-      const raw = JSON.parse(readFileSync(AUDIT_PATH, "utf-8"));
-      if (Array.isArray(raw)) list = raw;
-    } catch {
-      /* 无历史 */
-    }
-    list.unshift({ time: Date.now(), action, detail });
-    if (list.length > 500) list.length = 500;
-    writeFileSync(AUDIT_PATH, JSON.stringify(list), "utf-8");
-  } catch {
-    /* 审计写入失败不影响主流程 */
-  }
-}
-
-function loadHistoryEvents(): PortEvent[] {
-  try {
-    const raw = JSON.parse(readFileSync(HISTORY_PATH, "utf-8"));
-    if (!Array.isArray(raw)) return [];
-    return raw
-      .filter(
-        (e) =>
-          e &&
-          typeof e.time === "number" &&
-          (e.type === "open" || e.type === "close") &&
-          typeof e.port === "number",
-      )
-      .slice(0, MAX_EVENTS);
-  } catch {
-    return [];
-  }
-}
-
-function saveHistoryEvents(list: PortEvent[]): void {
-  try {
-    writeFileSync(HISTORY_PATH, JSON.stringify(list.slice(0, MAX_EVENTS)), "utf-8");
-  } catch {
-    /* 写入失败不影响服务 */
-  }
-}
-
-async function loadHtml(): Promise<string> {
-  try {
-    return await readFile(join(HERE, "web", "index.html"), "utf-8");
-  } catch {
-    return embeddedHtml;
-  }
+interface PortEvent {
+  time: number;
+  type: "open" | "close";
+  port: number;
+  pid: number;
+  process: string;
+  protocol: "tcp" | "udp";
+  address?: string;
 }
 
 interface ScanCache {
@@ -94,26 +86,170 @@ interface ScanCache {
   durationMs: number;
 }
 
-interface PortEvent {
-  time: number;
-  type: "open" | "close";
-  port: number;
-  pid: number;
-  process: string;
-}
-
 export interface RunningServer {
   port: number;
+  token: string;
   stop: () => void;
   config: DevDeckConfig;
 }
 
+function entryKey(entry: { port: number; protocol: string; address?: string }): string {
+  return `${entry.protocol}|${entry.address ?? ""}|${entry.port}`;
+}
+
 function json(res: ServerResponse, code: number, data: unknown) {
+  if (res.headersSent) {
+    try {
+      res.end();
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
   res.writeHead(code, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
   });
   res.end(JSON.stringify(data));
+}
+
+function readJson(path: string): unknown {
+  try {
+    if (!existsSync(path)) return null;
+    return JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeJson(path: string, value: unknown): void {
+  try {
+    writeFileSync(path, JSON.stringify(value), "utf-8");
+  } catch {
+    /* 持久化失败不影响服务 */
+  }
+}
+
+function audit(action: string, detail: string): void {
+  const raw = readJson(AUDIT_PATH);
+  const list: AuditEntry[] = Array.isArray(raw)
+    ? raw.filter(
+        (e): e is AuditEntry =>
+          Boolean(e) &&
+          typeof (e as AuditEntry).time === "number" &&
+          typeof (e as AuditEntry).action === "string" &&
+          typeof (e as AuditEntry).detail === "string",
+      )
+    : [];
+  list.unshift({ time: Date.now(), action, detail });
+  if (list.length > 500) list.length = 500;
+  writeJson(AUDIT_PATH, list);
+}
+
+function loadHistoryEvents(): PortEvent[] {
+  const raw = readJson(HISTORY_PATH);
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(
+      (e): e is PortEvent =>
+        Boolean(e) &&
+        typeof (e as PortEvent).time === "number" &&
+        ((e as PortEvent).type === "open" || (e as PortEvent).type === "close") &&
+        typeof (e as PortEvent).port === "number" &&
+        Number.isInteger((e as PortEvent).port),
+    )
+    .map((e): PortEvent => ({
+      ...e,
+      pid: Number.isInteger(e.pid) ? e.pid : 0,
+      process: typeof e.process === "string" ? e.process : "unknown",
+      protocol: e.protocol === "udp" ? "udp" : "tcp",
+      address: typeof e.address === "string" ? e.address : undefined,
+    }))
+    .slice(0, MAX_EVENTS);
+}
+
+function saveHistoryEvents(list: PortEvent[]): void {
+  writeJson(HISTORY_PATH, list.slice(0, MAX_EVENTS));
+}
+
+function loadFirstSeen(): Map<number, number> {
+  const raw = readJson(FIRST_SEEN_PATH);
+  const map = new Map<number, number>();
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      const port = Number(key);
+      if (Number.isInteger(port) && port > 0 && port < 65536 && typeof value === "number") {
+        map.set(port, value);
+      }
+    }
+  }
+  return map;
+}
+
+function saveFirstSeen(map: Map<number, number>): void {
+  const obj: Record<string, number> = {};
+  for (const [port, time] of map) obj[String(port)] = time;
+  writeJson(FIRST_SEEN_PATH, obj);
+}
+
+function loadLastPorts(): { map: Map<string, PortEntry>; loaded: boolean } {
+  const raw = readJson(LAST_PORTS_PATH);
+  const map = new Map<string, PortEntry>();
+  if (!Array.isArray(raw)) return { map, loaded: false };
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const e = item as PortEntry;
+    if (
+      !Number.isInteger(e.port) ||
+      e.port <= 0 ||
+      e.port > 65535 ||
+      !Number.isInteger(e.pid) ||
+      typeof e.process !== "string"
+    ) {
+      continue;
+    }
+    const protocol = e.protocol === "udp" ? "udp" : "tcp";
+    const address = typeof e.address === "string" ? e.address : undefined;
+    map.set(entryKey({ port: e.port, protocol, address }), {
+      port: e.port,
+      pid: e.pid,
+      process: e.process,
+      protocol,
+      address,
+      category: e.category === "dev" || e.category === "db" || e.category === "cache" ? e.category : "other",
+      label: typeof e.label === "string" ? e.label : "",
+    });
+  }
+  return { map, loaded: true };
+}
+
+function saveLastPorts(map: Map<string, PortEntry>): void {
+  writeJson(LAST_PORTS_PATH, [...map.values()]);
+}
+
+let htmlTemplate: string | null = null;
+
+async function getHtmlTemplate(): Promise<string> {
+  if (htmlTemplate) return htmlTemplate;
+  try {
+    htmlTemplate = await readFile(join(HERE, "web", "index.html"), "utf-8");
+  } catch {
+    htmlTemplate = embeddedHtml;
+  }
+  return htmlTemplate;
+}
+
+function htmlHeaders(): Record<string, string> {
+  return {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy":
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  };
 }
 
 async function readBody(req: IncomingMessage): Promise<string> {
@@ -122,7 +258,14 @@ async function readBody(req: IncomingMessage): Promise<string> {
   for await (const chunk of req) {
     const buf = chunk as Buffer;
     size += buf.length;
-    if (size > 64 * 1024) throw new Error("请求体过大");
+    if (size > 64 * 1024) {
+      try {
+        req.destroy();
+      } catch {
+        /* ignore */
+      }
+      throw new Error("请求体过大");
+    }
     chunks.push(buf);
   }
   return Buffer.concat(chunks).toString("utf-8");
@@ -130,8 +273,15 @@ async function readBody(req: IncomingMessage): Promise<string> {
 
 async function sendWebhook(url: string, event: PortEvent): Promise<void> {
   if (!url) return;
+  let parsed: URL;
   try {
-    await fetch(url, {
+    parsed = new URL(url);
+  } catch {
+    return;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+  try {
+    await fetch(parsed, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(event),
@@ -142,18 +292,143 @@ async function sendWebhook(url: string, event: PortEvent): Promise<void> {
   }
 }
 
+function allowedHost(host: string | undefined): boolean {
+  const value = (host ?? "").toLowerCase().replace(/:\d+$/, "");
+  return value === "127.0.0.1" || value === "localhost" || value === "[::1]";
+}
+
+function validProbeHost(host: string): boolean {
+  return host.length > 0 && host.length <= 255 && /^[a-zA-Z0-9._:\-\[\]]+$/.test(host);
+}
+
+function apiAccess(req: IncomingMessage, res: ServerResponse, url: URL, token: string): boolean {
+  if (!allowedHost(req.headers.host)) {
+    json(res, 403, { ok: false, message: "非法 Host" });
+    return false;
+  }
+  const origin = req.headers.origin;
+  if (origin) {
+    const host = req.headers.host ?? "";
+    if (origin !== `http://${host}` && origin !== `https://${host}`) {
+      json(res, 403, { ok: false, message: "非法 Origin" });
+      return false;
+    }
+  }
+  if (req.headers["sec-fetch-site"] === "cross-site") {
+    json(res, 403, { ok: false, message: "跨站请求被拒绝" });
+    return false;
+  }
+  if (url.pathname !== "/api/health") {
+    const raw = req.headers["x-devdeck-token"] ?? url.searchParams.get("token");
+    const supplied = Array.isArray(raw) ? raw[0] : raw;
+    const a = Buffer.from(String(supplied ?? ""));
+    const b = Buffer.from(token);
+    if (a.length !== b.length || !timingSafeEqual(a, b)) {
+      json(res, 401, { ok: false, message: "未授权" });
+      return false;
+    }
+  }
+  if (req.method === "POST" || req.method === "PUT") {
+    const contentType = req.headers["content-type"] ?? "";
+    if (!/^application\/json\b/i.test(contentType)) {
+      json(res, 415, { ok: false, message: "Content-Type 必须为 application/json" });
+      return false;
+    }
+  }
+  return true;
+}
+
 export function startServer(defaultPort = 7676): Promise<RunningServer> {
   const config = loadConfig();
+  const token = randomBytes(18).toString("hex");
   let cache: ScanCache | null = null;
-  let initialized = false;
-  const prevPorts = new Map<number, PortEntry>();
+  let inflight: Promise<ScanCache> | null = null;
+  const last = loadLastPorts();
+  const prevPorts = last.map;
+  let initialized = last.loaded;
   const scanTimes: number[] = [];
-  const events: PortEvent[] = loadHistoryEvents();
-  const firstSeen = new Map<number, number>();
+  const events = loadHistoryEvents();
+  const firstSeen = loadFirstSeen();
+  let snapshotTimer: NodeJS.Timeout | null = null;
+  let reportTimer: NodeJS.Timeout | null = null;
+  let sseClients = 0;
 
-  async function getScan(): Promise<ScanCache> {
+  function prune(dir: string, prefix: string): void {
+    try {
+      const files = readdirSync(dir)
+        .filter((f) => f.startsWith(prefix))
+        .sort();
+      while (files.length > MAX_ARTIFACTS) {
+        const file = files.shift();
+        if (!file) break;
+        unlinkSync(join(dir, file));
+      }
+    } catch {
+      /* 目录不存在或清理失败忽略 */
+    }
+  }
+
+  async function writeSnapshot(): Promise<void> {
+    try {
+      const scan = await getScan();
+      mkdirSync(SNAPSHOT_DIR, { recursive: true });
+      writeFileSync(
+        join(SNAPSHOT_DIR, `snap-${Date.now()}.json`),
+        JSON.stringify({ time: Date.now(), entries: scan.all }),
+        "utf-8",
+      );
+      prune(SNAPSHOT_DIR, "snap-");
+    } catch {
+      /* 快照失败忽略 */
+    }
+  }
+
+  async function writeReport(): Promise<void> {
+    try {
+      const scan = await getScan();
+      mkdirSync(REPORT_DIR, { recursive: true });
+      const health = scan.all.length
+        ? Math.round(
+            scan.all.reduce((sum, p) => {
+              if (!p.mem) return sum + 100;
+              const mb = p.mem / 1024;
+              return sum + (mb > 500 ? 60 : mb > 200 ? 80 : 100);
+            }, 0) / scan.all.length,
+          )
+        : 100;
+      writeFileSync(
+        join(REPORT_DIR, `health-${Date.now()}.json`),
+        JSON.stringify({
+          time: Date.now(),
+          healthScore: health,
+          total: scan.all.length,
+          dev: scan.dev.length,
+        }),
+        "utf-8",
+      );
+      prune(REPORT_DIR, "health-");
+    } catch {
+      /* 报告失败忽略 */
+    }
+  }
+
+  function applySchedules(): void {
+    if (snapshotTimer) clearInterval(snapshotTimer);
+    if (reportTimer) clearInterval(reportTimer);
+    snapshotTimer = null;
+    reportTimer = null;
+    if (config.snapshotInterval > 0) {
+      snapshotTimer = setInterval(() => void writeSnapshot(), config.snapshotInterval * 1000);
+      snapshotTimer.unref();
+    }
+    if (config.reportInterval > 0) {
+      reportTimer = setInterval(() => void writeReport(), config.reportInterval * 1000);
+      reportTimer.unref();
+    }
+  }
+
+  async function doScan(): Promise<ScanCache> {
     const now = Date.now();
-    if (cache && now - cache.at < Math.max(SCAN_CACHE_TTL, cache.durationMs)) return cache;
     const started = Date.now();
     const all = await listAllListening();
     const devSet = new Set([...COMMON_PORTS, ...config.customPorts]);
@@ -162,61 +437,111 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
     scanTimes.push(cache.durationMs);
     if (scanTimes.length > 200) scanTimes.shift();
 
-    const current = new Map(all.map((e) => [e.port, e] as const));
+    const current = new Map(all.map((e) => [entryKey(e), e] as const));
+    const changedEvents: PortEvent[] = [];
+    const wasInitialized = initialized;
+
     if (initialized) {
-      let changed = false;
-      for (const [port, e] of current) {
-        if (!prevPorts.has(port)) {
-          events.unshift({ time: now, type: "open", port, pid: e.pid, process: e.process });
-          changed = true;
+      for (const [key, e] of current) {
+        if (!prevPorts.has(key)) {
+          changedEvents.push({
+            time: now,
+            type: "open",
+            port: e.port,
+            pid: e.pid,
+            process: e.process,
+            protocol: e.protocol,
+            address: e.address,
+          });
         }
       }
-      for (const [port, e] of prevPorts) {
-        if (!current.has(port)) {
-          events.unshift({ time: now, type: "close", port, pid: e.pid, process: e.process });
-          changed = true;
+      for (const [key, e] of prevPorts) {
+        if (!current.has(key)) {
+          changedEvents.push({
+            time: now,
+            type: "close",
+            port: e.port,
+            pid: e.pid,
+            process: e.process,
+            protocol: e.protocol,
+            address: e.address,
+          });
         }
       }
-      if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
-      if (changed) saveHistoryEvents(events);
-      if (changed) {
-        for (const e of events.slice(0, 4)) void sendWebhook(config.webhookUrl, e);
+      if (changedEvents.length) {
+        events.unshift(...changedEvents);
+        if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+        saveHistoryEvents(events);
+        for (const event of changedEvents) void sendWebhook(config.webhookUrl, event);
       }
     } else {
       initialized = true;
     }
-    for (const port of current.keys()) {
-      if (!firstSeen.has(port)) firstSeen.set(port, now);
+
+    let firstSeenChanged = false;
+    for (const e of all) {
+      if (!firstSeen.has(e.port)) {
+        firstSeen.set(e.port, now);
+        firstSeenChanged = true;
+      }
     }
+    const livePorts = new Set(all.map((e) => e.port));
     for (const port of [...firstSeen.keys()]) {
-      if (!current.has(port)) firstSeen.delete(port);
+      if (!livePorts.has(port)) {
+        firstSeen.delete(port);
+        firstSeenChanged = true;
+      }
     }
+
     prevPorts.clear();
-    for (const [port, e] of current) prevPorts.set(port, e);
+    for (const [key, e] of current) prevPorts.set(key, e);
+
+    if (!wasInitialized || changedEvents.length > 0 || firstSeenChanged) {
+      saveFirstSeen(firstSeen);
+      saveLastPorts(prevPorts);
+    }
     return cache;
   }
 
+  function getScan(): Promise<ScanCache> {
+    const now = Date.now();
+    if (cache && now - cache.at < SCAN_CACHE_TTL) return Promise.resolve(cache);
+    if (inflight) return inflight;
+    inflight = doScan().finally(() => {
+      inflight = null;
+    });
+    return inflight;
+  }
+
+  function buildStats(ports: PortEntry[], scan: ScanCache) {
+    return {
+      total: ports.length,
+      dev: ports.filter((e) => e.category === "dev").length,
+      db: ports.filter((e) => e.category === "db").length,
+      cache: ports.filter((e) => e.category === "cache").length,
+      other: ports.filter((e) => e.category === "other").length,
+      listeningAll: scan.all.length,
+    };
+  }
+
+  function renderPorts(scan: ScanCache, scope: "dev" | "all"): PortEntry[] {
+    const ignored = new Set(config.ignored);
+    return (scope === "all" ? scan.all : scan.dev)
+      .filter((e) => !ignored.has(e.port))
+      .map((e) => ({ ...e, firstSeen: firstSeen.get(e.port) ?? scan.at }));
+  }
+
   async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    if (!apiAccess(req, res, url, token)) return;
     const path = url.pathname;
 
     if (req.method === "GET" && path === "/api/ports") {
       const scope = url.searchParams.get("scope") === "all" ? "all" : "dev";
       const scan = await getScan();
-      const ignored = new Set(config.ignored);
-      const ports = (scope === "all" ? scan.all : scan.dev)
-        .filter((e) => !ignored.has(e.port))
-        .map((e) => ({ ...e, firstSeen: firstSeen.get(e.port) ?? scan.at }));
-      const stats = {
-        total: ports.length,
-        dev: ports.filter((e) => e.category === "dev").length,
-        db: ports.filter((e) => e.category === "db").length,
-        cache: ports.filter((e) => e.category === "cache").length,
-        other: ports.filter((e) => e.category === "other").length,
-        listeningAll: scan.all.length,
-      };
+      const ports = renderPorts(scan, scope);
       json(res, 200, {
         ports,
-        stats,
+        stats: buildStats(ports, scan),
         meta: {
           scope,
           durationMs: scan.durationMs,
@@ -228,36 +553,37 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
     }
 
     if (req.method === "GET" && path === "/api/events") {
+      if (sseClients >= MAX_SSE_CLIENTS) {
+        json(res, 503, { ok: false, message: "实时连接数已达上限" });
+        return;
+      }
+      sseClients++;
+      const requested = Number(url.searchParams.get("interval"));
+      const interval =
+        Number.isFinite(requested) && requested >= 0 && requested <= 60
+          ? Math.round(requested)
+          : config.interval;
+      const scope = url.searchParams.get("scope") === "all" ? "all" : "dev";
       res.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-store",
         Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
       });
       res.write("retry: 4000\n\n");
       let closed = false;
       const send = (payload: unknown) => {
-        if (!closed) res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        if (!closed && !res.writableEnded) res.write(`data: ${JSON.stringify(payload)}\n\n`);
       };
       const push = async () => {
         try {
           const scan = await getScan();
-          const ignored = new Set(config.ignored);
-          const ports = (config.scope === "all" ? scan.all : scan.dev)
-            .filter((e) => !ignored.has(e.port))
-            .map((e) => ({ ...e, firstSeen: firstSeen.get(e.port) ?? scan.at }));
-          const stats = {
-            total: ports.length,
-            dev: ports.filter((e) => e.category === "dev").length,
-            db: ports.filter((e) => e.category === "db").length,
-            cache: ports.filter((e) => e.category === "cache").length,
-            other: ports.filter((e) => e.category === "other").length,
-            listeningAll: scan.all.length,
-          };
+          const ports = renderPorts(scan, scope);
           send({
             ports,
-            stats,
+            stats: buildStats(ports, scan),
             meta: {
-              scope: config.scope,
+              scope,
               durationMs: scan.durationMs,
               timestamp: scan.at,
               platform: process.platform,
@@ -267,38 +593,57 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
           /* 单次推送失败忽略 */
         }
       };
-      void push();
-      const timer = setInterval(() => {
+      if (interval > 0) {
         void push();
-      }, Math.max(1, config.interval) * 1000);
+      }
+      const timer = interval > 0 ? setInterval(() => void push(), interval * 1000) : null;
       const heartbeat = setInterval(() => {
-        if (!closed) res.write(": ping\n\n");
+        if (!closed && !res.writableEnded) res.write(": ping\n\n");
       }, 15000);
-      req.on("close", () => {
+      const close = () => {
+        if (closed) return;
         closed = true;
-        clearInterval(timer);
+        sseClients = Math.max(0, sseClients - 1);
+        if (timer) clearInterval(timer);
         clearInterval(heartbeat);
-        res.end();
-      });
+        try {
+          res.end();
+        } catch {
+          /* ignore */
+        }
+      };
+      req.on("close", close);
+      res.on("close", close);
       return;
     }
 
     if (req.method === "GET" && path === "/api/probe") {
-      const host = url.searchParams.get("host") || "127.0.0.1";
+      const host = (url.searchParams.get("host") || "127.0.0.1").trim();
+      if (!validProbeHost(host)) {
+        json(res, 400, { ok: false, message: "主机参数无效" });
+        return;
+      }
       const portsParam = url.searchParams.get("ports");
       if (portsParam) {
-        const list = portsParam.split(",").map((v) => Number(v.trim())).filter((n) => Number.isInteger(n) && n > 0 && n < 65536).slice(0, 50);
+        const list = portsParam
+          .split(",")
+          .map((v) => Number(v.trim()))
+          .filter((n) => Number.isInteger(n) && n > 0 && n < 65536)
+          .slice(0, 50);
+        if (list.length === 0) {
+          json(res, 400, { ok: false, message: "端口列表无效" });
+          return;
+        }
         const results = await Promise.all(list.map((p) => probeTcp(host, p)));
         json(res, 200, { host, results });
         return;
       }
       const port = Number(url.searchParams.get("port"));
-      if (!/^[a-zA-Z0-9.:-]+$/.test(host) || !Number.isInteger(port) || port <= 0 || port > 65535) {
+      if (!Number.isInteger(port) || port <= 0 || port > 65535) {
         json(res, 400, { ok: false, message: "参数无效" });
         return;
       }
-      const result = await probeTcp(host, port);
-      json(res, 200, result);
+      json(res, 200, await probeTcp(host, port));
       return;
     }
 
@@ -321,38 +666,35 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
         freeMemMB: Math.round(freemem() / 1048576),
         loadavg: loadavg(),
         uptimeSec: Math.round(uptime()),
+        processUptimeSec: Math.round(process.uptime()),
         addresses,
       });
       return;
     }
 
     if (req.method === "GET" && path === "/api/audit") {
-      let list: AuditEntry[] = [];
-      try {
-        const raw = JSON.parse(readFileSync(AUDIT_PATH, "utf-8"));
-        if (Array.isArray(raw)) list = raw;
-      } catch {
-        /* 无审计记录 */
-      }
-      json(res, 200, { events: list.slice(0, 100) });
+      const raw = readJson(AUDIT_PATH);
+      const list = Array.isArray(raw) ? raw.slice(0, 100) : [];
+      json(res, 200, { events: list });
       return;
     }
 
     if (req.method === "GET" && path === "/api/connections") {
-      const stats = await connectionStats();
-      json(res, 200, stats);
+      json(res, 200, await connectionStats());
       return;
     }
 
     if (req.method === "GET" && path === "/api/stats") {
       const sorted = [...scanTimes].sort((a, b) => a - b);
-      const avg = scanTimes.length ? Math.round(scanTimes.reduce((s, n) => s + n, 0) / scanTimes.length) : 0;
+      const avg = scanTimes.length
+        ? Math.round(scanTimes.reduce((s, n) => s + n, 0) / scanTimes.length)
+        : 0;
       json(res, 200, {
         count: scanTimes.length,
         avgMs: avg,
         minMs: sorted[0] ?? 0,
         maxMs: sorted[sorted.length - 1] ?? 0,
-        p95Ms: sorted[Math.floor(sorted.length * 0.95)] ?? 0,
+        p95Ms: sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] : 0,
         recent: scanTimes.slice(-20),
       });
       return;
@@ -361,9 +703,23 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
     if (req.method === "GET" && path === "/api/export-history") {
       const format = url.searchParams.get("format") === "csv" ? "csv" : "json";
       if (format === "csv") {
-        const header = "time,type,port,pid,process";
-        const rows = events.map((e) => `${new Date(e.time).toISOString()},${e.type},${e.port},${e.pid},"${e.process.replace(/"/g, '"')}"`);
-        res.writeHead(200, { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=\"devdeck-history.csv\"" });
+        const header = "time,type,port,protocol,address,pid,process";
+        const rows = events.map((e) =>
+          [
+            new Date(e.time).toISOString(),
+            e.type,
+            e.port,
+            e.protocol,
+            csvEscape(e.address ?? ""),
+            e.pid,
+            csvEscape(e.process),
+          ].join(","),
+        );
+        res.writeHead(200, {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": 'attachment; filename="devdeck-history.csv"',
+          "X-Content-Type-Options": "nosniff",
+        });
         res.end("\uFEFF" + [header, ...rows].join("\r\n"));
       } else {
         json(res, 200, { generatedAt: Date.now(), events });
@@ -398,7 +754,10 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
       }
       let suggestion = 0;
       for (let p = port + 1; p < port + 50 && p < 65536; p++) {
-        if (!used.has(p)) { suggestion = p; break; }
+        if (!used.has(p)) {
+          suggestion = p;
+          break;
+        }
       }
       json(res, 200, { port, available: false, suggestion });
       return;
@@ -429,7 +788,8 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
     if (req.method === "GET" && path === "/api/export") {
       const scope = url.searchParams.get("scope") === "all" ? "all" : "dev";
       const fmt = url.searchParams.get("format");
-      const format = fmt === "csv" ? "csv" : fmt === "md" ? "md" : fmt === "html" ? "html" : fmt === "xls" ? "xls" : "json";
+      const format =
+        fmt === "csv" ? "csv" : fmt === "md" ? "md" : fmt === "html" ? "html" : fmt === "xls" ? "xls" : "json";
       const scan = await getScan();
       const ignored = new Set(config.ignored);
       const ports = (scope === "all" ? scan.all : scan.dev).filter((e) => !ignored.has(e.port));
@@ -437,7 +797,7 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
       if (format === "xls") {
         res.writeHead(200, {
           "Content-Type": "application/vnd.ms-excel; charset=utf-8",
-          "Content-Disposition": `attachment; filename="devdeck-ports-${stamp}.xml"`,
+          "Content-Disposition": `attachment; filename="devdeck-ports-${stamp}.xls"`,
         });
         res.end(toExcelXml(ports));
       } else if (format === "html") {
@@ -470,21 +830,29 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
 
     if (req.method === "POST" && path === "/api/kill") {
       try {
-        const body = JSON.parse(await readBody(req)) as { pid?: unknown; pids?: unknown; port?: unknown; tree?: unknown };
+        const body = JSON.parse(await readBody(req)) as {
+          pid?: unknown;
+          pids?: unknown;
+          port?: unknown;
+          tree?: unknown;
+        };
         let pids: number[];
-        if (body.port) {
+        if (body.port !== undefined) {
           const target = Number(body.port);
           const scan = await getScan();
-          const hit = scan.all.find((e) => e.port === target);
-          if (!hit) {
+          pids = [
+            ...new Set(scan.all.filter((e) => e.port === target).map((e) => e.pid).filter((p) => p > 0)),
+          ];
+          if (pids.length === 0) {
             json(res, 404, { ok: false, message: `端口 ${target} 当前未被监听` });
             return;
           }
-          pids = [hit.pid];
+        } else if (Array.isArray(body.pids)) {
+          pids = body.pids.map(Number);
         } else {
-          pids = Array.isArray(body.pids) ? body.pids.map(Number) : [Number(body.pid)];
+          pids = [Number(body.pid)];
         }
-        const valid = pids.filter((p) => Number.isInteger(p) && p > 0);
+        const valid = [...new Set(pids.filter((p) => Number.isInteger(p) && p > 0))];
         if (valid.length === 0) {
           json(res, 400, { ok: false, message: "缺少有效的 PID" });
           return;
@@ -496,8 +864,7 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
             results.push({ pid, ok: true });
             audit("kill", `PID ${pid}`);
           } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            results.push({ pid, ok: false, message });
+            results.push({ pid, ok: false, message: err instanceof Error ? err.message : String(err) });
           }
         }
         cache = null;
@@ -529,6 +896,7 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
           saveConfig(next);
           Object.assign(config, next);
           cache = null;
+          applySchedules();
           audit("config", JSON.stringify(next));
           json(res, 200, { ok: true, config });
         } catch (err) {
@@ -543,15 +911,21 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
   }
 
   const server = createServer(async (req, res) => {
-  server.on("clientError", (err, socket) => {
-    try { socket.destroy(); } catch { /* 客户端异常断开时安全关闭 */ }
-  });
     try {
+      if (!allowedHost(req.headers.host)) {
+        json(res, 403, { ok: false, message: "非法 Host" });
+        return;
+      }
       const url = new URL(req.url ?? "/", "http://localhost");
       if (url.pathname === "/" || url.pathname === "/index.html") {
-        const html = await loadHtml();
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        const html = (await getHtmlTemplate()).replace(/__DEVDECK_TOKEN__/g, token);
+        res.writeHead(200, htmlHeaders());
         res.end(html);
+        return;
+      }
+      if (url.pathname === "/favicon.ico") {
+        res.writeHead(204, { "Cache-Control": "public, max-age=86400" });
+        res.end();
         return;
       }
       if (url.pathname.startsWith("/api/")) {
@@ -563,6 +937,14 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       json(res, 500, { ok: false, message });
+    }
+  });
+
+  server.on("clientError", (_err, socket) => {
+    try {
+      socket.destroy();
+    } catch {
+      /* 客户端异常断开时安全关闭 */
     }
   });
 
@@ -580,54 +962,19 @@ export function startServer(defaultPort = 7676): Promise<RunningServer> {
       };
       server.once("error", onError);
       server.listen(port, "127.0.0.1", () => {
+        server.removeListener("error", onError);
         const address = server.address();
         const actual = typeof address === "object" && address ? address.port : port;
-        let snapshotTimer: NodeJS.Timeout | null = null;
-        let reportTimer: NodeJS.Timeout | null = null;
-        if (config.snapshotInterval > 0) {
-          const dir = join(homedir(), ".devdeck-snapshots");
-          snapshotTimer = setInterval(() => {
-            void (async () => {
-              try {
-                const scan = await getScan();
-                mkdirSync(dir, { recursive: true });
-                writeFileSync(
-                  join(dir, `snap-${Date.now()}.json`),
-                  JSON.stringify({ time: Date.now(), ports: scan.all }),
-                );
-              } catch {
-                /* 快照失败忽略 */
-              }
-            })();
-          }, config.snapshotInterval * 1000);
-          snapshotTimer.unref();
-        if (config.reportInterval > 0) {
-          const dir = join(homedir(), ".devdeck-reports");
-          reportTimer = setInterval(() => {
-            void (async () => {
-              try {
-                const scan = await getScan();
-                mkdirSync(dir, { recursive: true });
-                const health = scan.all.length
-                  ? Math.round(scan.all.reduce((s, p) => s + (p.mem && p.mem / 1024 > 500 ? 60 : p.mem && p.mem / 1024 > 200 ? 80 : 100), 0) / scan.all.length)
-                  : 100;
-                writeFileSync(
-                  join(dir, `health-${Date.now()}.json`),
-                  JSON.stringify({ time: Date.now(), healthScore: health, total: scan.all.length, dev: scan.dev.length })
-                );
-              } catch { /* ignore */ }
-            })();
-          }, config.reportInterval * 1000);
-          reportTimer.unref();
-        }
-        }
+        applySchedules();
         resolve({
           port: actual,
+          token,
           config,
           stop: () => {
             if (snapshotTimer) clearInterval(snapshotTimer);
             if (reportTimer) clearInterval(reportTimer);
             server.close();
+            server.closeAllConnections?.();
           },
         });
         void getScan().catch(() => {

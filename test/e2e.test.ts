@@ -165,6 +165,13 @@ test("E2E: GET/PUT /api/config 读写、校验与 Content-Type", async () => {
     body: JSON.stringify({ favorites: [] }),
   });
   assert.equal(wrongType.status, 415);
+
+  const sameSite = await api("/api/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-site" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(sameSite.status, 403);
 });
 
 test("E2E: POST /api/kill 无令牌 401、text/plain 415、无效 PID 正确失败", async () => {
@@ -198,6 +205,24 @@ test("E2E: POST /api/kill 无令牌 401、text/plain 415、无效 PID 正确失�
   });
   const e = (await empty.json()) as { ok: boolean };
   assert.equal(e.ok, false);
+
+  const protectedPid = await api("/api/kill", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pids: [4] }),
+  });
+  const p = (await protectedPid.json()) as { results: Array<{ ok: boolean; message?: string }> };
+  assert.equal(p.results[0]?.ok, false);
+  assert.match(p.results[0]?.message ?? "", /系统关键进程|不在当前端口扫描/);
+
+  const notListening = await api("/api/kill", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pids: [999998] }),
+  });
+  const n = (await notListening.json()) as { results: Array<{ ok: boolean; message?: string }> };
+  assert.equal(n.results[0]?.ok, false);
+  assert.match(n.results[0]?.message ?? "", /不在当前端口扫描|系统关键进程/);
 });
 
 test("E2E: 未知 API 404", async () => {

@@ -12,7 +12,7 @@
     "url": "https://github.com/xuange-hu/devdeck/issues"
   },
   "bin": {
-    "devdeck": "./dist/cli.js"
+    "devdeck": "dist/cli.js"
   },
   "files": [
     "dist/cli.js",

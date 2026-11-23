@@ -29,7 +29,28 @@ DevDeck 不是 npm 库，也不是多主机监控平台，定位是**单机、�
 
 完整对比：https://github.com/xuange-hu/devdeck/blob/main/docs/compare.md
 
-## 安装
+## 安装（推荐）
+
+### Windows
+
+下载单文件 exe，解压后直接运行，不需要安装 Node：
+
+```text
+https://github.com/xuange-hu/devdeck/releases/latest/download/devdeck.exe
+```
+
+### macOS / Linux / 已装 Node
+
+直接从 GitHub Release 安装：
+
+```bash
+npm install -g https://github.com/xuange-hu/devdeck/releases/download/v0.8.0/devdeck-cli-0.8.0.tgz
+devdeck version
+```
+
+> npm registry 上的 `devdeck-cli` 仍在发布流程中；如果 `npm install -g devdeck-cli` 暂时 404，请使用上面的 Release 安装。
+
+## 从源码安装
 
 ```bash
 cd devdeck
@@ -37,7 +58,7 @@ npm install
 npm run build
 ```
 
-### 全局安装（可选）
+### 源码安装后全局链接（可选）
 
 ```bash
 npm link          # 之后可在任意目录直接执行 devdeck

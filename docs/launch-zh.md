@@ -60,10 +60,20 @@ devdeck watch -i 3 --all
 
 ## 安装
 
+Windows 直接下载单文件 exe，不需要安装 Node：
+
+```text
+https://github.com/xuange-hu/devdeck/releases/latest/download/devdeck.exe
+```
+
+macOS / Linux / 已装 Node：
+
 ```bash
-npm install -g devdeck-cli
+npm install -g https://github.com/xuange-hu/devdeck/releases/download/v0.8.0/devdeck-cli-0.8.0.tgz
 devdeck
 ```
+
+npm registry 上的 `devdeck-cli` 还在发布流程中；如果 `npm install -g devdeck-cli` 暂时 404，用上面的 Release 安装。
 
 或者从源码构建：
 
@@ -74,8 +84,6 @@ npm install
 npm run build
 node dist/cli.js ui
 ```
-
-Windows 单文件 exe 可从 GitHub Releases 下载，解压后直接运行。
 
 ## 我想要什么反馈
 
